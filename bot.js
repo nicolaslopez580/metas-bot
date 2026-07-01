@@ -1,3 +1,4 @@
+require('dotenv').config();
 const { Telegraf, session, Scenes, Markup } = require('telegraf');
 const fetch = require('node-fetch');
 
