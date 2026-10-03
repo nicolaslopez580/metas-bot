@@ -3,7 +3,7 @@ require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
-const { getResumen, getHabilidades } = require('./api');
+const { getResumen, getHabilidades, getHabitos, checkHabito } = require('./api');
 const { parseAmount, parseDate, todayISO } = require('./parse');
 const { tryHandleQuery } = require('./query');
 const { registrar: apiRegistrar } = require('./api');
@@ -74,7 +74,9 @@ bot.start(ctx => ctx.reply(
   '/encamino — metas 50–99%\n' +
   '/completas — al 100%\n' +
   '/habilidades — aprendiendo ahora\n' +
-  '/registrar — registrar progreso\n\n' +
+  '/registrar — registrar progreso\n' +
+  '/habitos — hábitos de hoy y rachas\n' +
+  '/hecho &lt;hábito&gt; [cantidad] — marcar un hábito\n\n' +
   it('También podés escribir en lenguaje natural:\n"cómo voy con running", "cuándo termino meditación", "registrá 10 en running"'),
   { parse_mode: 'HTML' }
 ));
@@ -129,6 +131,51 @@ bot.command('habilidades', async ctx => {
     items.slice(0, 10).forEach((h, i) => {
       lines.push(`${i + 1}. ${b(esc(h.nombre))} ${it(`(${esc(h.categoria || 'Sin cat.')})`)}`);
     });
+    ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+  } catch (e) { ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
+});
+
+// ── Hábitos ───────────────────────────────────────────────────────────────
+
+function habitoLinea(h) {
+  const e = h.estado;
+  const icon  = e.hechoHoy ? '✅' : e.programadoHoy ? '⬜' : '➖';
+  const racha = e.racha.actual ? ` 🔥${e.racha.actual}` : '';
+  let extra = '';
+  if (h.tipo === 'numero') extra += ` ${it(`${e.valorHoy || 0}/${h.objetivoDia} ${h.unidad || ''}`.trim())}`;
+  if (h.frecuencia?.tipo === 'semanal') extra += ` ${it(`${e.semana}/${e.vecesSemana} esta semana`)}`;
+  else if (!e.programadoHoy) extra += ` ${it('hoy no toca')}`;
+  return `${icon} ${h.emoji ? esc(h.emoji) + ' ' : ''}${b(h.nombre)}${racha}${extra}`;
+}
+
+bot.command('habitos', async ctx => {
+  try {
+    const items = await getHabitos();
+    if (!items.length) return ctx.reply('No tenés hábitos activos. Crealos desde la web.');
+    const prog  = items.filter(h => h.estado.programadoHoy);
+    const hechos = prog.filter(h => h.estado.hechoHoy).length;
+    ctx.reply([
+      `🔁 ${b(`Hábitos de hoy — ${hechos}/${prog.length}`)}\n`,
+      ...items.map(habitoLinea),
+      '',
+      it('Marcá con /hecho <hábito> [cantidad]'),
+    ].join('\n'), { parse_mode: 'HTML' });
+  } catch (e) { ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
+});
+
+bot.command('hecho', async ctx => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  if (!args.length) return ctx.reply('Usá: /hecho <hábito> [cantidad]\nEj: /hecho leer 25 · /hecho meditar');
+  // Si el último argumento es un número, es la cantidad del día
+  let valor;
+  const n = parseAmount(args[args.length - 1]);
+  if (args.length > 1 && /\d/.test(args[args.length - 1]) && Number.isFinite(n)) { valor = n; args.pop(); }
+  try {
+    const r = await checkHabito(args.join(' '), valor);
+    const h = r.item;
+    const lines = [`✅ ${b('Hecho!')}\n`, habitoLinea(h)];
+    if (h.estado.racha.actual) lines.push(`🔥 Racha: ${b(`${h.estado.racha.actual} ${h.estado.racha.unidad}`)}`);
+    if (r.metaSync) lines.push(it(`Sumado a la meta "${r.metaSync.meta}" (${r.metaSync.delta > 0 ? '+' : ''}${r.metaSync.delta})`));
     ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) { ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
 });

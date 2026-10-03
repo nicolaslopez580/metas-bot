@@ -1,2 +1,4 @@
 node_modules/
 .env
+# Graphify knowledge graph output
+graphify-out/
