@@ -47,4 +47,18 @@ async function checkHabito(ref, valor, fecha) {
   return body;
 }
 
-module.exports = { getResumen, registrar, getHabilidades, getHabitos, checkHabito };
+// Devuelve { status, body } sin tirar en 404/409: el caller muestra los `candidatos`.
+async function call(path, opts = {}) {
+  const r = await fetch(`${BASE}${path}`, { headers, timeout: 15000, ...opts });
+  const body = await r.json().catch(() => ({}));
+  if (r.status >= 500 || r.status === 401) throw new Error(body.error || `API ${r.status}`);
+  return { status: r.status, body };
+}
+
+const getMeta        = q => call(`/api/bot/meta?q=${encodeURIComponent(q)}`);
+const getFaltantes   = () => call('/api/bot/faltantes');
+const registrarLibre = (texto, fecha) => call('/api/bot/registrar-libre', {
+  method: 'POST', body: JSON.stringify({ texto, fecha }),
+});
+
+module.exports = { getResumen, registrar, getHabilidades, getHabitos, checkHabito, getMeta, getFaltantes, registrarLibre };

@@ -349,6 +349,8 @@ bot.on('text', async ctx => {
       'No entendí eso. Probá:\n' +
       '• /registrar — registrar progreso con botones\n' +
       '• "cómo voy con running"\n' +
+      '• "qué me falta este mes"\n' +
+      '• "leí 40 páginas" / "corrí 5 km"\n' +
       '• "registrá 10 en meditación"\n' +
       '• "cuándo termino lectura"\n' +
       '• /resumen — estado general'

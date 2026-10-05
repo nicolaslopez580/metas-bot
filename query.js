@@ -1,5 +1,5 @@
 'use strict';
-const { getResumen, registrar: apiRegistrar, getHabilidades } = require('./api');
+const { getResumen, registrar: apiRegistrar, getHabilidades, getMeta, getFaltantes, registrarLibre } = require('./api');
 const { parseAmount, todayISO } = require('./parse');
 
 // ── Formatters ─────────────────────────────────────────────────────────────
@@ -128,7 +128,15 @@ async function handleMetaEspecifica(text) {
     .trim();
 
   const meta = matchMeta(query || text, goals.filter(g => g.year === year));
-  if (!meta) return { text: `No encontré esa meta. Usá /resumen para ver todas.` };
+  if (!meta) {
+    const { body } = await getMeta(query || text);
+    const cand = (body.candidatos || []).slice(0, 5);
+    return { text: `No encontré esa meta.${cand.length ? `\n¿Quisiste decir: ${cand.map(c => it(c)).join(', ')}?` : ' Usá /resumen para ver todas.'}` };
+  }
+
+  // Detalle del server: what-if + dependencias (si falla, se muestra lo básico)
+  let det = null;
+  try { const r = await getMeta(meta.descripcion); if (r.status === 200) det = r.body.meta; } catch {}
 
   const { velocidadDiaria, diasRestantes, alcanzable, gap, expectedProgress } = meta;
   const bar = makeBar(meta.progreso);
@@ -150,7 +158,65 @@ async function handleMetaEspecifica(text) {
   if (diasRestantes != null) lines.push(`Días restantes del año: ${diasRestantes}`);
   if (alcanzable !== null) lines.push(alcanzable ? it('✅ Alcanzable este año') : it('⚠️ Difícil al ritmo actual'));
 
+  const w = det && det.whatIf;
+  if (w) {
+    lines.push('', `🔮 ${b('Qué pasa si…')}`);
+    if (w.faltante > 0) {
+      lines.push(`Para llegar: ${b(fmtN(w.porMes))} por mes · ${fmtN(w.porSemana)} por semana`);
+      lines.push(`A tu ritmo (${fmtN(w.ritmoMensual)}/mes) cerrás el año en ${b(fmtN(w.alFinDeAño))} / ${meta.objetivo}`);
+      if (w.fechaFin) lines.push(w.llega ? `🏁 Llegarías el ${fechaLarga(w.fechaFin)}` : `🐢 Recién llegarías el ${fechaLarga(w.fechaFin)}`);
+    } else lines.push('🏁 Ya está cumplida.');
+  }
+  if (det && det.bloqueada) lines.push('', `🔒 Bloqueada: primero ${esc(det.dependeDe || 'otra meta')}`);
+
   return { text: lines.join('\n') };
+}
+
+function fmtN(n) { return Number(n || 0).toLocaleString('es-AR', { maximumFractionDigits: 1 }); }
+function fechaLarga(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('es-AR', { day: 'numeric', month: 'long' });
+}
+
+// 3b. Qué me falta este mes: ritmo mensual necesario por meta + hábitos de hoy
+async function handleFaltantes() {
+  const { body } = await getFaltantes();
+  const metas = (body.metas || []).filter(m => m.whatIf && m.whatIf.faltante > 0);
+  const lines = [`📋 ${b('Lo que te falta este mes')}`, SEP];
+  if (!metas.length) lines.push(it('Nada pendiente en metas con objetivo numérico.'));
+  metas.slice(0, 10).forEach(m => {
+    const w = m.whatIf;
+    const icon = m.bloqueada ? '🔒' : w.llega ? '🟢' : '🔴';
+    lines.push(`${icon} ${esc(m.descripcion)} — ${b(fmtN(w.porMes))} este mes ${it(`(${pct(m.progreso)})`)}`);
+  });
+  if (metas.length > 10) lines.push(it(`+${metas.length - 10} más`));
+  const hab = body.habitosHoy || [];
+  if (hab.length) {
+    lines.push('', `✅ ${b('Hábitos pendientes hoy:')}`);
+    hab.forEach(h => lines.push(`  ${h.emoji || '•'} ${esc(h.nombre)}`));
+  }
+  return { text: lines.join('\n') };
+}
+
+// 9. Registro en texto libre: "leí 40 páginas", "corrí 5 km" (fallback con número)
+async function handleRegistroLibre(text) {
+  const { status, body } = await registrarLibre(text, todayISO());
+  if (status === 404) return null; // no matcheó nada → mensaje de ayuda
+  if (status === 409) {
+    return { text: `🤔 Puede ser más de una: ${(body.candidatos || []).map(c => it(c)).join(', ')}.\nSé más específico o usá /registrar.` };
+  }
+  if (status !== 200) return { text: `⚠️ ${esc(body.error || 'No pude registrarlo')}` };
+  if (body.tipo === 'habito') {
+    const lines = [`✅ ${b('Hábito registrado')}`, '', `${body.emoji || '•'} ${esc(body.nombre)}: ${b(fmtN(body.valor))}${body.unidad ? ' ' + esc(body.unidad) : ''}${body.objetivoDia ? ` / ${fmtN(body.objetivoDia)}` : ''}`];
+    if (body.racha) lines.push(`🔥 Racha: ${body.racha} días`);
+    if (body.metaSync) lines.push(it(`También sumó a "${body.metaSync}"`));
+    return { text: lines.join('\n') };
+  }
+  const p = body.objetivo > 0 ? Math.round(body.completado / body.objetivo * 100) : 0;
+  return {
+    text: [`✅ ${b('Registrado!')}`, '', `📌 ${esc(body.nombre)}`, `➕ +${fmtN(body.valor)}`, `📊 Total: ${b(`${fmtN(body.completado)} / ${fmtN(body.objetivo)}`)} (${p}%)`].join('\n'),
+    addRecent: body.nombre,
+  };
 }
 
 // 4. Por categoría/pilar: "metas de salud"
@@ -291,6 +357,9 @@ const INTENTS = [
   { test: t => /\b(top\s+metas?|mejor(es)?\s+(desempe[ñn]o|performance)|ranking|podio)\b/i.test(t),
     handle: handleRanking },
 
+  { test: t => /\bqu[eé]\s+(me\s+)?falta\b/i.test(t) && /\b(mes|hoy|semana)\b/i.test(t) || /^qu[eé]\s+me\s+falta\??$/i.test(t.trim()),
+    handle: handleFaltantes },
+
   { test: t => /\b(atrasad[ao]s?|pendiente[s]?|qu[eé]\s+(me\s+)?falta|voy\s+mal|d[eé]ficit)\b/i.test(t),
     handle: handleAtrasadasNL },
 
@@ -307,6 +376,18 @@ async function tryHandleQuery(ctx, text, addRecentFn) {
     if (!test(text)) continue;
     try {
       const result = await handle(text);
+      await ctx.reply(result.text, { parse_mode: 'HTML' });
+      if (result.addRecent && addRecentFn) addRecentFn(result.addRecent);
+    } catch (e) {
+      await ctx.reply(`⚠️ Error: ${esc(e.message)}`, { parse_mode: 'HTML' });
+    }
+    return true;
+  }
+  // Fallback: texto con número y sin pregunta → intento de registro libre
+  if (/\d/.test(text) && !text.includes('?')) {
+    try {
+      const result = await handleRegistroLibre(text);
+      if (!result) return false;
       await ctx.reply(result.text, { parse_mode: 'HTML' });
       if (result.addRecent && addRecentFn) addRecentFn(result.addRecent);
     } catch (e) {
