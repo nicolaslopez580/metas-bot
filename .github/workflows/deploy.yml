@@ -1,0 +1,52 @@
+name: Deploy
+
+# Deploy al VPS DonWeb en cada push a la rama por defecto (incluye merges de PRs
+# hechos desde el celular). Las ramas claude/* no deployan hasta que se mergean.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy al VPS por SSH
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        env:
+          APP_DIR: /root/apps/metas-bot
+          BRANCH: main
+          PM2_NAME: "bots"       # vacío = solo actualiza el código, no reinicia nada
+          SOURCE_ENV: "0"  # el proceso `bots` lee cada .env por su cuenta
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          envs: APP_DIR,BRANCH,PM2_NAME,SOURCE_ENV
+          command_timeout: 8m
+          script: |
+            set -eu
+            cd "$APP_DIR"
+            OLD=$(git rev-parse HEAD)
+            git fetch origin "$BRANCH"
+            git merge --ff-only "origin/$BRANCH"   # falla en vez de pisar cambios hechos a mano en el VPS
+            NEW=$(git rev-parse HEAD)
+            if [ "$OLD" != "$NEW" ] && git diff --name-only "$OLD" "$NEW" | grep -qE '^package(-lock)?\.json$'; then
+              if git ls-files --error-unmatch package-lock.json >/dev/null 2>&1; then npm ci --omit=dev
+              else npm install --omit=dev --no-audit --no-fund; fi
+            fi
+            if [ -n "$PM2_NAME" ]; then
+              if [ "$SOURCE_ENV" = "1" ] && [ -f .env ]; then set -a; . ./.env; set +a; fi   # PM2 no lee .env solo
+              pm2 restart "$PM2_NAME" --update-env
+              pm2 save
+            fi
+            git log --oneline -1
