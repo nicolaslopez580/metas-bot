@@ -3,7 +3,8 @@ require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
-const { getResumen, getHabilidades, getHabitos, checkHabito } = require('./api');
+const { getResumen, getHabilidades, getHabitos, checkHabito, transcribirVoz, interpretarIA, getCoach } = require('./api');
+const fetch = require('node-fetch');
 const { parseAmount, parseDate, todayISO } = require('./parse');
 const { tryHandleQuery } = require('./query');
 const { registrar: apiRegistrar } = require('./api');
@@ -100,7 +101,12 @@ bot.command('resumen', async ctx => {
       '',
       it(`${activas} metas activas pendientes`),
     ].join('\n'), { parse_mode: 'HTML' });
-  } catch (e) { ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
+  } catch (e) { return ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
+  // Párrafo de coach (IA) como segundo mensaje; si falla, el resumen ya salió
+  try {
+    const { status, body } = await getCoach();
+    if (status === 200 && body.texto) await ctx.reply(`🧭 ${b('Coach de la semana')}\n\n${esc(body.texto)}`, { parse_mode: 'HTML' });
+  } catch (e) { console.error('[coach]', e.message); }
 });
 
 async function sendByEstado(ctx, estado, emoji, label) {
@@ -112,7 +118,7 @@ async function sendByEstado(ctx, estado, emoji, label) {
 
     const lines = [`${emoji} ${b(`${label} (${lista.length})`)}\n`];
     lista.forEach(g => {
-      lines.push(`${estadoEmoji(g.estado)} ${b(esc(g.descripcion))}\n${makeBar(g.progreso)} ${pct(g.progreso)} (${g.completado}/${g.objetivo})`);
+      lines.push(`${estadoEmoji(g.estado)} ${b(g.descripcion)}\n${makeBar(g.progreso)} ${pct(g.progreso)} (${g.completado}/${g.objetivo})`);
     });
     const full = lines.join('\n');
     ctx.reply(full.length > 4000 ? full.slice(0, 3990) + '\n…' : full, { parse_mode: 'HTML' });
@@ -129,7 +135,7 @@ bot.command('habilidades', async ctx => {
     if (!items.length) return ctx.reply('No hay habilidades en aprendizaje actualmente.');
     const lines = [`📚 ${b('Aprendiendo ahora')}\n`];
     items.slice(0, 10).forEach((h, i) => {
-      lines.push(`${i + 1}. ${b(esc(h.nombre))} ${it(`(${esc(h.categoria || 'Sin cat.')})`)}`);
+      lines.push(`${i + 1}. ${b(h.nombre)} ${it(`(${esc(h.categoria || 'Sin cat.')})`)}`);
     });
     ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
   } catch (e) { ctx.reply(`❌ ${esc(e.message)}`, { parse_mode: 'HTML' }); }
@@ -245,7 +251,7 @@ bot.action(/^rm_(\d+)$/, async ctx => {
   saveSessions();
   await ctx.answerCbQuery();
   ctx.editMessageText(
-    `📌 ${b(esc(s.data.meta.descripcion))}\n` +
+    `📌 ${b(s.data.meta.descripcion)}\n` +
     `📊 Actual: ${s.data.meta.completado} / ${s.data.meta.objetivo} ${it(`(${pct(s.data.meta.progreso)})`)}\n\n` +
     `¿Cuánto completaste? ${it('(escribí el número)')}`,
     { parse_mode: 'HTML' }
@@ -343,18 +349,77 @@ bot.on('text', async ctx => {
   }
 
   // ── Lenguaje natural ──────────────────────────────────────
-  const handled = await tryHandleQuery(ctx, text, addRecent);
-  if (!handled) {
-    ctx.reply(
-      'No entendí eso. Probá:\n' +
-      '• /registrar — registrar progreso con botones\n' +
-      '• "cómo voy con running"\n' +
-      '• "qué me falta este mes"\n' +
-      '• "leí 40 páginas" / "corrí 5 km"\n' +
-      '• "registrá 10 en meditación"\n' +
-      '• "cuándo termino lectura"\n' +
-      '• /resumen — estado general'
-    );
+  return handleLibre(ctx, text);
+});
+
+const AYUDA =
+  'No entendí eso. Probá:\n' +
+  '• /registrar — registrar progreso con botones\n' +
+  '• "cómo voy con running"\n' +
+  '• "qué me falta este mes"\n' +
+  '• "leí 40 páginas" / "corrí 5 km"\n' +
+  '• "registrá 10 en meditación"\n' +
+  '• "cuándo termino lectura"\n' +
+  '• /resumen — estado general';
+
+// Reglas primero (rápidas, deterministas); si no entienden, interpreta la IA.
+// La IA nunca escribe sola: propone y se confirma con un botón.
+const pendientesIA = new Map();   // id corto → { tipo, nombre, valor, ts }
+
+async function handleLibre(ctx, text) {
+  if (await tryHandleQuery(ctx, text, addRecent)) return;
+  let r;
+  try { r = await interpretarIA(text); } catch (e) { console.error('[ia]', e.message); return ctx.reply(AYUDA); }
+  if (r.status !== 200) return ctx.reply(AYUDA);
+  const j = r.body;
+  if (j.accion !== 'registrar') return ctx.reply(`💬 ${esc(j.texto || 'No tengo una respuesta para eso.')}`, { parse_mode: 'HTML' });
+  if (j.tipo === 'meta' && j.valor == null) {
+    return ctx.reply(`Entendí que es para ${b(j.nombre)}, pero no cuánto. Decime la cantidad (ej. "registrá 1 en ${esc(j.nombre)}") o usá /registrar.`, { parse_mode: 'HTML' });
+  }
+  for (const [k, v] of pendientesIA) if (Date.now() - v.ts > 30 * 60000) pendientesIA.delete(k);
+  const key = Date.now().toString(36);
+  pendientesIA.set(key, { tipo: j.tipo, nombre: j.nombre, valor: j.valor, ts: Date.now() });
+  const que = j.tipo === 'habito'
+    ? `el hábito ${b(j.nombre)}${j.valor != null ? `: ${b(String(j.valor))}` : ''}`
+    : `${b(String(j.valor))} en ${b(j.nombre)}`;
+  return ctx.reply(`🤖 ¿Registro ${que} para hoy?`, { parse_mode: 'HTML', ...Markup.inlineKeyboard([
+    [Markup.button.callback('✅ Sí', `ia_ok_${key}`), Markup.button.callback('❌ No', `ia_no_${key}`)],
+  ]) });
+}
+
+bot.action(/^ia_(ok|no)_(\w+)$/, async ctx => {
+  ctx.answerCbQuery().catch(() => {});
+  const p = pendientesIA.get(ctx.match[2]);
+  pendientesIA.delete(ctx.match[2]);
+  if (!p) return ctx.editMessageText('⏱ Esa propuesta venció. Mandalo de nuevo.');
+  if (ctx.match[1] === 'no') return ctx.editMessageText('Listo, no registré nada.');
+  try {
+    if (p.tipo === 'habito') {
+      const r = await checkHabito(p.nombre, p.valor == null ? undefined : p.valor, todayISO());
+      const ra = r.item && r.item.estado && r.item.estado.racha;
+      const racha = ra && ra.actual ? ` · 🔥 ${ra.actual} ${ra.unidad}` : '';
+      return ctx.editMessageText(`✅ Hábito ${b(p.nombre)} registrado${racha}`, { parse_mode: 'HTML' });
+    }
+    await apiRegistrar(p.nombre, p.valor, todayISO());
+    addRecent(p.nombre);
+    return ctx.editMessageText(`✅ Registré ${b(String(p.valor))} en ${b(p.nombre)}`, { parse_mode: 'HTML' });
+  } catch (e) {
+    return ctx.editMessageText(`❌ No pude registrarlo: ${esc(e.message)}`, { parse_mode: 'HTML' });
+  }
+});
+
+// ── Notas de voz → Whisper → mismo camino que el texto ──────────────────
+bot.on('voice', async ctx => {
+  try {
+    const link = await ctx.telegram.getFileLink(ctx.message.voice.file_id);
+    const r = await fetch(String(link), { timeout: 30000 });
+    if (!r.ok) throw new Error(`Telegram ${r.status}`);
+    const texto = (await transcribirVoz(await r.buffer(), ctx.message.voice.mime_type || 'audio/ogg')).trim();
+    if (!texto) return ctx.reply('🎙 No escuché nada en el audio.');
+    await ctx.reply(`🎙 ${it(texto)}`, { parse_mode: 'HTML' });
+    return handleLibre(ctx, texto);
+  } catch (e) {
+    return ctx.reply(`❌ No pude procesar el audio: ${esc(e.message)}`, { parse_mode: 'HTML' });
   }
 });
 

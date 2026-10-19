@@ -61,4 +61,17 @@ const registrarLibre = (texto, fecha) => call('/api/bot/registrar-libre', {
   method: 'POST', body: JSON.stringify({ texto, fecha }),
 });
 
-module.exports = { getResumen, registrar, getHabilidades, getHabitos, checkHabito, getMeta, getFaltantes, registrarLibre };
+// ── IA (Groq, corre en la app) ──
+async function transcribirVoz(buf, mime = 'audio/ogg') {
+  const r = await fetch(`${BASE}/api/bot/voz`, {
+    method: 'POST', headers: { 'Content-Type': mime, 'x-bot-secret': SECRET }, body: buf, timeout: 70000,
+  });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || `API ${r.status}`);
+  return body.texto || '';
+}
+const interpretarIA = texto => call('/api/bot/interpretar', { method: 'POST', body: JSON.stringify({ texto }), timeout: 50000 });
+const getCoach      = () => call('/api/bot/coach', { timeout: 50000 });
+
+module.exports = { getResumen, registrar, getHabilidades, getHabitos, checkHabito, getMeta, getFaltantes, registrarLibre,
+  transcribirVoz, interpretarIA, getCoach };
